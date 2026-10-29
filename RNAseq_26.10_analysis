@@ -1,0 +1,324 @@
+
+### IMPORTAÇÃO DE BIBLIOTECAS ################################################################################
+library(dplyr)
+library(tibble)
+library(edgeR)
+library(ggplot2)
+library(tidyr)
+library(pheatmap)
+library(ggrepel)
+
+### CONFIGURAR AMBIENTE DE TRABALHO & IMPORTAR MATRIZ DE EXPRESSÃO ###########################################
+
+# (Opcional) Define a pasta de trabalho onde estão seus arquivos
+setwd("C:/Users/conta/OneDrive/Estágio Dream Lab/data karol/RNAsq")
+
+# Importar o arquivo TSV
+matriz_expressao_raw <- read.delim(
+  "7MKSSV-expression-matrix.tsv",
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE
+)
+
+### COLETAR MATRIZ COM COUNTS #################################################################################
+matriz_raw_counts <- matriz_expressao_raw %>%
+  select(gene_id, gene_name, gene_biotype, ends_with("_count"))
+
+### ANOTAR MATRIZ DE COUNTS CORRETAMENTE ######################################################################
+# As amostras na matriz vieram com o nome do pedido, esse trecho de código é para fazer a correspondência entre 
+# os números de cada amostra do pedido e seus nomes.
+
+
+#Mapear correspondências
+sample_map <- data.frame(
+  OriginalID = c("7MKSSV_1_count","7MKSSV_2_count","7MKSSV_3_count","7MKSSV_4_count","7MKSSV_5_count","7MKSSV_6_count",
+                 "7MKSSV_7_count","7MKSSV_8_count", "7MKSSV_9_count", "7MKSSV_10_count","7MKSSV_11_count","7MKSSV_12_count"),             # complete com todas
+  SampleName = c("H1299sgNT_n1_1", "H1299sgNT_n2_2", "H1299sgNT_n3_3", "H1299sgKEAP1_n1_4", "H1299sgKEAP1_n2_5", "H1299sgKEAP1_n3_6",
+                 "H1299KO_mGFP_n1_7", "H1299KO_mGFP_n2_8", "H1299KO_mGFP_n3_9", "H1299KO_mKEAP1_n1_10", "H1299KO_mKEAP1_n2_11",
+                 "H1299KO_mKEAP1_n3_12")
+)
+
+sample_map$OriginalID <- sub("_count$", "", sample_map$OriginalID)
+
+ids_tabela <- sub("_count$", "", grep("_count$", colnames(matriz_raw_counts), value = TRUE))
+
+stopifnot(
+  !anyDuplicated(sample_map$OriginalID),        # nenhum ID repetido
+  !anyDuplicated(sample_map$SampleName),        # nenhum nome novo repetido
+  setequal(sample_map$OriginalID, ids_tabela)   # mesmas amostras nos dois lados # verificar se os nomes tão todos ali.
+)
+
+matriz_raw_counts_named <- matriz_raw_counts   # cópia: o original fica intacto
+
+count_cols <- grep("_count$", colnames(matriz_raw_counts_named))
+ids <- sub("_count$", "", colnames(matriz_raw_counts_named)[count_cols])
+
+colnames(matriz_raw_counts_named)[count_cols] <- sample_map$SampleName[match(ids, sample_map$OriginalID)]
+
+#Validação (deve retornar TRUE)
+colnames(matriz_raw_counts_named)
+identical(unname(as.matrix(matriz_raw_counts[, count_cols])),
+          unname(as.matrix(matriz_raw_counts_named[, count_cols])))   # deve dar TRUE
+
+### CONTROLE DE QUALIDADE DAS AMOSTRAS ############################################################################
+#Inicialmente, criaremos uma DGElist para avaliar parâmetros variados das amostras.
+
+
+metadata <- tribble(
+  ~OriginalID, ~SampleName,       ~Condition, ~Replicate,
+  "7MKSSV_1",  "H1299sgNT_n1_1",  "sgNT",     1,
+  "7MKSSV_2",  "H1299sgNT_n2_2",  "sgNT",     2,
+  "7MKSSV_3",  "H1299sgNT_n3_3",  "sgNT",     3,
+  "7MKSSV_4",  "H1299sgKEAP1_n1_4",  "sgKEAP1",     1,
+  "7MKSSV_5",  "H1299sgKEAP1_n2_5",  "sgKEAP1",     2,
+  "7MKSSV_6",  "H1299sgKEAP1_n3_6",  "sgKEAP1",     3,
+  "7MKSSV_7",  "H1299KO_mGFP_n1_7",  "KOmGFP",     1,
+  "7MKSSV_8",  "H1299KO_mGFP_n2_8",  "KOmGFP",     2,
+  "7MKSSV_9",  "H1299KO_mGFP_n3_9",  "KOmGFP",     3,
+  "7MKSSV_10",  "H1299KO_mKEAP1_n1_10",  "KOmKEAP1",     1,
+  "7MKSSV_11",  "H1299KO_mKEAP1_n2_11",  "KOmKEAP1",     2,
+  "7MKSSV_12",  "H1299KO_mKEAP1_n3_12",  "KOmKEAP1",     3
+  # ... uma linha por amostra
+)
+
+# Conferir se o sample_map e o metadata têm a mesma correspondência
+stopifnot(identical(sample_map$OriginalID, metadata$OriginalID),
+          identical(sample_map$SampleName, metadata$SampleName))
+
+#Agrupar amostras conforme os grupos (na ordem que aparecem)
+metadata$Condition <- factor(metadata$Condition,
+                             levels = c("sgNT", "sgKEAP1", "KOmGFP", "KOmKEAP1"))
+#Conferir
+table(metadata$Condition)
+
+### SEPARAR ANOTAÇÃO DOS GENES E MATRIZ DE COUNTS ####################################################
+
+# Tabela com a descrição de cada gene
+anotacao_genes <- matriz_raw_counts_named[, c("gene_id", "gene_name", "gene_biotype")]
+
+# Matriz só com números, com as colunas na ordem do metadata
+matriz_counts <- as.matrix(matriz_raw_counts_named[, metadata$SampleName])
+rownames(matriz_counts) <- matriz_raw_counts_named$gene_id
+
+#Conferências
+dim(matriz_counts)                                       # nº de genes x 12
+identical(colnames(matriz_counts), metadata$SampleName)  # deve dar TRUE
+anyDuplicated(rownames(matriz_counts))                   # deve dar 0
+anyNA(matriz_counts)                                     # deve dar FALSE
+is.numeric(matriz_counts)                                # deve dar TRUE
+
+### CRIAR OBJETO DO edgeR (DGEList) ##########################################################
+#É basicamente um objeto agrupado que usamos como base para consultas daqui em diante. 
+
+# Nomear as linhas da anotação pelo gene_id, igual à matriz de counts
+rownames(anotacao_genes) <- anotacao_genes$gene_id
+
+dge <- DGEList(counts = matriz_counts,
+               group  = metadata$Condition,
+               genes  = anotacao_genes)
+
+# Guardar as demais informações das amostras dentro do objeto
+dge$samples$Replicate  <- metadata$Replicate
+dge$samples$OriginalID <- metadata$OriginalID
+
+#Conferências
+identical(rownames(dge$samples), metadata$SampleName)  # deve dar TRUE
+identical(rownames(dge$genes), rownames(dge$counts))   # deve dar TRUE
+dge$samples
+
+### MÉTRICAS DE CONTROLE DE QUALIDADE POR AMOSTRA ##############################################################
+
+# CPM simples (ainda sem normalização TMM), só para contar genes detectados
+cpm_bruto <- cpm(dge)
+
+# Identificar genes mitocondriais (humanos começam com "MT-") e de rRNA
+genes_mitocondriais <- grepl("^MT-", dge$genes$gene_name)
+genes_rRNA          <- dge$genes$gene_biotype %in% c("rRNA", "Mt_rRNA", "rRNA_pseudogene")
+sum(genes_mitocondriais)   # deve ser em torno de 37 em humanos
+sum(genes_rRNA)
+
+# Função: % dos counts que vão para os 20 genes mais expressos
+pct_top20 <- function(x) 100 * sum(sort(x, decreasing = TRUE)[1:20]) / sum(x)
+
+qc_amostras <- data.frame(
+  SampleName       = colnames(dge),
+  Condition        = dge$samples$group,
+  lib_size_milhoes = round(dge$samples$lib.size / 1e6, 2),
+  genes_detectados = colSums(dge$counts > 0),
+  genes_cpm1       = colSums(cpm_bruto >= 1),
+  pct_mito         = round(100 * colSums(dge$counts[genes_mitocondriais, ]) / dge$samples$lib.size, 2),
+  pct_rrna         = round(100 * colSums(dge$counts[genes_rRNA, ]) / dge$samples$lib.size, 2),
+  pct_top20        = round(apply(dge$counts, 2, pct_top20), 2),
+  row.names = NULL
+)
+
+qc_amostras
+
+# EXPLICAÇÃO PARÂMETROS: ###
+# genes_cpm1: quantos genes têm expressão de pelo menos 1 CPM (count por milhão). É uma medida mais robusta de “genes realmente expressos”. 
+#Uma amostra com bem menos genes que as réplicas pode ter RNA degradado ou biblioteca de baixa qualidade.
+#pct_mito: % das leituras que vêm de genes mitocondriais. Um valor bem mais alto que o das réplicas sugere estresse ou morte celular, ou degradação.
+#pct_rrna: % das leituras em RNA ribossomal. Deveria ser baixa; um valor alto indica falha na remoção de rRNA durante o preparo da biblioteca.
+#pct_top20: % das leituras que caem nos 20 genes mais expressos. Se poucos genes concentram muito do sinal, a biblioteca tem baixa complexidade.
+
+### FILTRAGEM DE GENES POUCO EXPRESSOS E NORMALIZAÇÃO TMM ###################################
+
+# 5a. Decidir quais genes manter
+# Ela mantém um gene se ele tiver expressão razoável (equivalente a ~10 reads) 
+#em pelo menos tantas amostras quanto o menor grupo, que no caso é 3.
+genes_expressos <- filterByExpr(dge, group = dge$samples$group) 
+table(genes_expressos)   # FALSE = removidos; TRUE = mantidos
+
+# 5b. Criar um novo objeto só com os genes mantidos
+dge_filtrado <- dge[genes_expressos, , keep.lib.sizes = FALSE]
+
+# 5c. Normalização TMM
+dge_filtrado <- calcNormFactors(dge_filtrado, method = "TMM")
+
+# 5d. Expressão normalizada em escala log (logCPM)
+logCPM <- cpm(dge_filtrado, log = TRUE, prior.count = 2)
+
+dim(dge_filtrado)              # nº de genes mantidos x 12
+dge_filtrado$samples           # veja a coluna norm.factors
+summary(as.vector(logCPM))
+
+### DISTRIBUIÇÃO DA EXPRESSÃO NORMALIZADA ####################################################
+
+# Transformar o logCPM em formato "longo" (uma linha por gene por amostra), exigido pelo ggplot
+logCPM_longo <- as.data.frame(logCPM) %>%
+  rownames_to_column("gene_id") %>%
+  pivot_longer(-gene_id, names_to = "SampleName", values_to = "logCPM") %>%
+  left_join(metadata %>% select(SampleName, Condition), by = "SampleName") %>%
+  mutate(SampleName = factor(SampleName, levels = metadata$SampleName))
+
+# 6a. Boxplot por amostra
+ggplot(logCPM_longo, aes(x = SampleName, y = logCPM, fill = Condition)) +
+  geom_boxplot(outlier.size = 0.3) +
+  geom_hline(yintercept = median(logCPM), linetype = "dashed") +
+  labs(title    = "Distribution of normalized expression per sample",
+       subtitle = "TMM-normalized log2 CPM, filtered genes",
+       x        = "Sample",
+       y        = expression(log[2]~"CPM"),
+       fill     = "Condition") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 6b. Curvas de densidade
+ggplot(logCPM_longo, aes(x = logCPM, group = SampleName, colour = Condition)) +
+  geom_density() +
+  labs(title    = "Density of normalized expression per sample",
+       subtitle = "TMM-normalized log2 CPM, filtered genes",
+       x        = expression(log[2]~"CPM"),
+       y        = "Density",
+       colour   = "Condition") +
+  theme_bw()
+
+### CORRELAÇÃO ENTRE AMOSTRAS ################################################################
+
+# 7a. Matriz de correlação de Pearson entre todas as amostras
+correlacao_amostras <- cor(logCPM, method = "pearson")
+round(correlacao_amostras, 3)
+
+# 7b. Agrupamento hierárquico das amostras com base na correlação
+clustering_amostras <- hclust(as.dist(1 - correlacao_amostras), method = "average")
+
+# 7c. Anotação de cores por condição (mesmas cores dos gráficos anteriores)
+anotacao_amostras <- data.frame(Condition = metadata$Condition,
+                                row.names = metadata$SampleName)
+cores_condicao <- list(Condition = setNames(scales::hue_pal()(4),
+                                            levels(metadata$Condition)))
+
+# 7d. Heatmap
+pheatmap(correlacao_amostras,
+         cluster_rows      = clustering_amostras,
+         cluster_cols      = clustering_amostras,
+         annotation_col    = anotacao_amostras,
+         annotation_row    = anotacao_amostras,
+         annotation_colors = cores_condicao,
+         display_numbers   = FALSE,
+         border_color      = NA,
+         cellwidth         = 20,
+         cellheight        = 20,
+         fontsize          = 9,
+         angle_col         = 45,
+         main = "Sample-to-sample Pearson correlation\n(TMM-normalized log2 CPM, filtered genes)",
+         filename = "sample_correlation_heatmap.pdf",
+         width = 9, height = 8)
+
+### PCA ######################################################################################
+
+# 8a. Selecionar os 500 genes mais variáveis entre as amostras
+# 500 é o padrão usado pelo edgeR e pelo DESeq2.
+variancia_genes <- apply(logCPM, 1, var)
+genes_mais_variaveis <- order(variancia_genes, decreasing = TRUE)[1:500]
+
+# 8b. Calcular a PCA (amostras nas linhas, por isso o t())
+pca <- prcomp(t(logCPM[genes_mais_variaveis, ]), center = TRUE, scale. = FALSE)
+
+# 8c. % de variância explicada por cada componente
+variancia_explicada <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+variancia_explicada
+
+# 8d. Tabela com os scores de cada amostra + metadata
+scores_pca <- as.data.frame(pca$x) %>%
+  rownames_to_column("SampleName") %>%
+  left_join(metadata, by = "SampleName")
+
+identical(scores_pca$SampleName, metadata$SampleName)   # deve dar TRUE
+
+# 8e. Gráfico PC1 vs PC2
+grafico_pca <- ggplot(scores_pca, aes(x = PC1, y = PC2, colour = Condition, shape = factor(Replicate))) +
+  geom_point(size = 3.5) +
+  geom_text_repel(aes(label = SampleName), size = 3, show.legend = FALSE, max.overlaps = Inf) +
+  scale_colour_manual(values = cores_condicao$Condition) +
+  labs(title    = "Principal component analysis",
+       subtitle = "Top 500 most variable genes, TMM-normalized log2 CPM",
+       x        = paste0("PC1 (", variancia_explicada[1], "% variance)"),
+       y        = paste0("PC2 (", variancia_explicada[2], "% variance)"),
+       colour   = "Condition",
+       shape    = "Replicate") +
+  theme_bw()
+
+while (dev.cur() > 1) dev.off()
+print(grafico_pca)
+
+
+### PCA APÓS REMOVER O EFEITO DA RÉPLICA (SÓ PARA VISUALIZAÇÃO) ##############################
+
+# 9a. Remover o efeito da réplica, preservando as diferenças entre condições
+desenho_condicao <- model.matrix(~ Condition, data = metadata)
+
+logCPM_sem_lote <- limma::removeBatchEffect(logCPM,
+                                            batch  = factor(metadata$Replicate),
+                                            design = desenho_condicao)
+
+# 9b. PCA com os 500 genes mais variáveis (recalculados nos dados corrigidos)
+variancia_genes_corr <- apply(logCPM_sem_lote, 1, var)
+genes_mais_variaveis_corr <- order(variancia_genes_corr, decreasing = TRUE)[1:500]
+
+pca_sem_lote <- prcomp(t(logCPM_sem_lote[genes_mais_variaveis_corr, ]),
+                       center = TRUE, scale. = FALSE)
+
+variancia_explicada_sem_lote <- round(100 * pca_sem_lote$sdev^2 / sum(pca_sem_lote$sdev^2), 1)
+variancia_explicada_sem_lote
+
+scores_pca_sem_lote <- as.data.frame(pca_sem_lote$x) %>%
+  rownames_to_column("SampleName") %>%
+  left_join(metadata, by = "SampleName")
+
+# 9c. Gráfico
+grafico_pca_sem_lote <- ggplot(scores_pca_sem_lote,
+                               aes(x = PC1, y = PC2, colour = Condition, shape = factor(Replicate))) +
+  geom_point(size = 3.5) +
+  geom_text_repel(aes(label = SampleName), size = 3, show.legend = FALSE, max.overlaps = Inf) +
+  scale_colour_manual(values = cores_condicao$Condition) +
+  labs(title    = "Principal component analysis after replicate effect removal",
+       subtitle = "Top 500 most variable genes, TMM-normalized log2 CPM (for visualization only)",
+       x        = paste0("PC1 (", variancia_explicada_sem_lote[1], "% variance)"),
+       y        = paste0("PC2 (", variancia_explicada_sem_lote[2], "% variance)"),
+       colour   = "Condition",
+       shape    = "Replicate") +
+  theme_bw()
+
+print(grafico_pca_sem_lote)
